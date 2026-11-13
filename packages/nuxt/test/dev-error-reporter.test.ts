@@ -1,0 +1,168 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ErrorReport } from 'my-bad'
+import { createDevErrorReporter, renderDevBadge, setErrorChannelForwarding, useErrorChannel } from '../src/runtime/server/dev-error/index'
+
+const report = { message: 'boom', causes: [], frames: [] } as unknown as ErrorReport
+
+function reporterFor (overrides: Partial<Parameters<typeof createDevErrorReporter<Request>>[0]> = {}) {
+  const createReport = vi.fn(() => Promise.resolve(report))
+  const mapStack = vi.fn()
+  const reporter = createDevErrorReporter<Request>({
+    cwd: '/repo',
+    channel: () => '/__nuxt_dev__/error',
+    createReport,
+    mapStack,
+    requestInfo: request => ({ method: request.method, url: new URL(request.url), headers: request.headers }),
+    ...overrides,
+  })
+  return { reporter, createReport, mapStack }
+}
+
+const request = () => new Request('http://localhost/failing?a=1')
+
+describe('dev error reporter', () => {
+  beforeEach(async () => {
+    setErrorChannelForwarding(() => true)
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    ;(await useErrorChannel()).clearError()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('builds the report on the error as raised, then maps its stack', async () => {
+    const { reporter, createReport, mapStack } = reporterFor()
+    const error = new Error('boom')
+
+    const result = await reporter(error, request())
+
+    expect(createReport).toHaveBeenCalledWith(error, expect.any(Request))
+    expect(mapStack).toHaveBeenCalledWith(error)
+    expect(createReport.mock.invocationCallOrder[0]!).toBeLessThan(mapStack.mock.invocationCallOrder[0]!)
+    expect(result?.report).toBe(report)
+  })
+
+  it('builds no report for an expected error, but still maps its stack', async () => {
+    const { reporter, createReport, mapStack } = reporterFor()
+    const error = new Error('not found')
+
+    expect(await reporter(error, request(), { expected: true })).toBeUndefined()
+    expect(createReport).not.toHaveBeenCalled()
+    expect(mapStack).toHaveBeenCalledWith(error)
+  })
+
+  it('returns the report even when it is not published or printed', async () => {
+    const { reporter } = reporterFor()
+    const channel = await useErrorChannel()
+
+    const result = await reporter(new Error('boom'), request(), { publish: false, print: false })
+
+    expect(result?.report).toBe(report)
+    expect(channel.current).toBeUndefined()
+    expect(console.log).not.toHaveBeenCalled()
+  })
+
+  it('publishes the report on the live channel, leaving printing to whoever owns it', async () => {
+    const { reporter } = reporterFor()
+
+    await reporter(new Error('boom'), request())
+
+    expect((await useErrorChannel()).current).toBe(report)
+    expect(console.log).not.toHaveBeenCalled()
+    expect(console.error).not.toHaveBeenCalled()
+  })
+
+  it('publishes a compile report to every page, whichever request ran into it', async () => {
+    const messages: Array<{ report: ErrorReport, requestId?: string, request?: string }> = []
+    const listener = new BroadcastChannel('nuxt:dev:error')
+    listener.onmessage = event => messages.push(event.data)
+    const compile = { ...report, kind: 'compile' } as ErrorReport
+    const { reporter } = reporterFor({ createReport: vi.fn().mockResolvedValueOnce(report).mockResolvedValueOnce(compile) })
+    const headers = { 'x-nuxt-dev-request-id': 'module-request' }
+
+    await reporter(new Error('boom'), new Request('http://localhost/failing', { headers }))
+    await reporter(new Error('boom'), new Request('http://localhost/_nuxt/app.vue', { headers }))
+    await vi.waitFor(() => expect(messages).toHaveLength(2))
+
+    expect(messages[0]).toMatchObject({ requestId: 'module-request', request: 'GET /failing' })
+    expect(messages[1]).toMatchObject({ report: { kind: 'compile' }, requestId: undefined, request: undefined })
+    listener.close()
+  })
+
+  it('publishes a report caused by a compile failure to every page', async () => {
+    const messages: Array<{ report: ErrorReport, requestId?: string, request?: string }> = []
+    const listener = new BroadcastChannel('nuxt:dev:error')
+    listener.onmessage = event => messages.push(event.data)
+    const wrapped = { ...report, causes: [{ ...report, id: 'cause', kind: 'compile' }] } as ErrorReport
+    const { reporter } = reporterFor({ createReport: vi.fn().mockResolvedValueOnce(wrapped) })
+
+    await reporter(new Error('boom'), new Request('http://localhost/failing', { headers: { 'x-nuxt-dev-request-id': 'page' } }))
+    await vi.waitFor(() => expect(messages).toHaveLength(1))
+
+    expect(messages[0]).toMatchObject({ requestId: undefined, request: undefined })
+    listener.close()
+  })
+
+  it('swallows a report that cannot be built', async () => {
+    const { reporter, mapStack } = reporterFor({ createReport: () => Promise.reject(new Error('no sourcemaps')) })
+    const error = new Error('boom')
+
+    expect(await reporter(error, request())).toBeUndefined()
+    expect(mapStack).toHaveBeenCalledWith(error)
+  })
+
+  it('prints the report when this process owns the channel', async () => {
+    setErrorChannelForwarding(() => false)
+    const { reporter } = reporterFor()
+
+    await reporter(new Error('boom'), request())
+
+    const printed = [...vi.mocked(console.log).mock.calls, ...vi.mocked(console.error).mock.calls]
+    expect(printed[0]?.[0]).toContain('[request error] [GET] http://localhost/failing?a=1')
+  })
+
+  it('strips control characters from the raw error it prints when the report cannot be rendered', async () => {
+    setErrorChannelForwarding(() => false)
+    const unrenderable = { message: 'boom', causes: [], frames: null } as unknown as ErrorReport
+    const { reporter } = reporterFor({ createReport: () => Promise.resolve(unrenderable) })
+    const error = new Error('\u001B]52;c;ZXZpbA==\u0007boom\u001B[2J')
+
+    await reporter(error, request())
+
+    expect(console.log).not.toHaveBeenCalled()
+    const printed = vi.mocked(console.error).mock.calls.flat().join(' ')
+    expect(printed).toContain(']52;c;ZXZpbA==boom[2J')
+    expect(printed).not.toContain('\u001B')
+    expect(printed).not.toContain('\u0007')
+  })
+})
+
+describe('dev error markup on a page with a CSP nonce', () => {
+  const scriptsWithout = (html: string, nonce: string) => html.match(/<script\b[^>]*>/g)!.filter(tag => !tag.includes(`nonce="${nonce}"`))
+
+  it('stamps the page nonce on every script of the badge', async () => {
+    const html = await renderDevBadge({ channel: '/__nuxt_dev__/error', nonce: 'abc123' })
+
+    expect(html.match(/<script\b/g)!.length).toBeGreaterThan(1)
+    expect(scriptsWithout(html, 'abc123')).toEqual([])
+  })
+
+  it('renders the badge without a nonce when the page has none', async () => {
+    expect(await renderDevBadge({ channel: '/__nuxt_dev__/error' })).not.toContain('nonce=')
+  })
+
+  it('stamps the overlay it adds to an error page with that page\'s nonce', async () => {
+    setErrorChannelForwarding(() => true)
+    const { reporter } = reporterFor({
+      createReport: () => Promise.resolve({ id: 'abc', kind: 'error', name: 'Error', message: 'boom', frames: [], causes: [], sections: [], timestamp: 0 } as unknown as ErrorReport),
+    })
+    const result = await reporter(new Error('boom'), request(), { publish: false, print: false })
+
+    const page = await result!.overlay('<html><head><script nonce="abc123" src="/_nuxt/entry.js"></script></head><body></body></html>')
+
+    expect(page).toContain('<nuxt-error-overlay')
+    expect(scriptsWithout(page, 'abc123')).toEqual([])
+  })
+})
