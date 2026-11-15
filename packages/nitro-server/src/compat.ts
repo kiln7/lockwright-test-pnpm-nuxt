@@ -105,8 +105,31 @@ interface ImportSpecifier {
 const STRING_LITERAL_RE = /^(['"])(.*)\1$/s
 const JSX_RE = /\.[cm]?[jt]sx$/
 
+interface ParsedImports {
+  code: string
+  specifiers: ImportSpecifier[]
+}
+
+/**
+ * The last parse of each file, reused while its code is unchanged. Each Nuxt instance
+ * keeps only the previous instance's parses.
+ */
+let parsedImports = new Map<string, ParsedImports>()
+let previousParsedImports = new Map<string, ParsedImports>()
+
 /** Module specifiers of the static and dynamic imports and re-exports of a file. */
 function findImportSpecifiers (code: string, filename: string): ImportSpecifier[] {
+  const cached = parsedImports.get(filename) ?? previousParsedImports.get(filename)
+  if (cached?.code === code) {
+    parsedImports.set(filename, cached)
+    return cached.specifiers
+  }
+  const specifiers = parseImportSpecifiers(code, filename)
+  parsedImports.set(filename, { code, specifiers })
+  return specifiers
+}
+
+function parseImportSpecifiers (code: string, filename: string): ImportSpecifier[] {
   const { module } = parseSync(filename, code, { lang: JSX_RE.test(filename) ? 'tsx' : 'ts', sourceType: 'module' })
   const specifiers: ImportSpecifier[] = []
   const add = (request: { start: number, end: number }, entries?: Array<{ isType: boolean, importName: { name: string | null } }>) => {
@@ -142,6 +165,9 @@ const LEGACY_SPECIFIER_RE = /^(?:h3(?:\/utils)?$|#imports$|nitropack(?:\/|$)|#in
 
 /** The specifiers that say a file is nitro v2 code. A migrated specifier wins over a legacy one. */
 function legacySpecifiers (code: string, filename: string, migratedVirtuals?: Set<string>): string[] {
+  if (!SPECIFIER_HINT_RE.test(code)) {
+    return []
+  }
   const legacy = new Set<string>()
   for (const specifier of findImportSpecifiers(code, filename)) {
     if (MIGRATED_SPECIFIER_RE.test(specifier.value) || migratedVirtuals?.has(specifier.value)) {
@@ -276,7 +302,7 @@ async function reportUserLegacyCode (dirs: string[], rootDir: string, legacy: Re
     } catch {
       continue
     }
-    const specifiers = findImportSpecifiers(code, path)
+    const specifiers = SPECIFIER_HINT_RE.test(code) ? findImportSpecifiers(code, path) : []
     if (!legacy.h3 && specifiers.some(specifier => !specifier.typeOnly && (specifier.value === 'h3' || specifier.value === 'h3/utils'))) {
       const version = resolveH3V1Version(dirname(path), h3V1Versions)
       if (version) {
@@ -640,6 +666,16 @@ export async function getServerImportsPresets (legacy: ResolvedNitroLegacyOption
  * call it once the nitro instance exists.
  */
 export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, legacy: ResolvedNitroLegacyOptions, modulePresets: LegacyImportsPreset[], installedModules: InstalledModule[] = [], unusedVariants: string[] = []): Promise<(nitro: Pick<Nitro, 'options' | 'hooks'>) => void> {
+  previousParsedImports = parsedImports
+  parsedImports = new Map()
+  // a build is not restarted, so nothing it parsed is read again
+  if (!nuxt.options.dev) {
+    nuxt.hook('close', () => {
+      parsedImports.clear()
+      previousParsedImports.clear()
+    })
+  }
+
   // resolved as the server build resolves them: a module may add an alias for the server
   // build only, or point an app alias at different code there
   const aliases: Record<string, string> = { ...nuxt.options.alias, ...nitroConfig.alias as Record<string, string> }
@@ -1030,6 +1066,10 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
 
   /** The scanned files the server build can reach, so app-side module code is left out. */
   const attributable = (found: Map<string, string[]>): Map<string, string[]> => {
+    // the walk only filters what the scan found
+    if (found.size === 0) {
+      return found
+    }
     const roots = new Set<string>()
     for (const id of files.keys()) {
       // a registration names a specifier, while the scan keys the file it read

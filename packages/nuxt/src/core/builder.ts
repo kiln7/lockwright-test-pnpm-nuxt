@@ -8,7 +8,7 @@ import { debounce } from 'perfect-debounce'
 import { dirname, join, normalize, relative, resolve } from 'pathe'
 
 import { isDirectory } from '../utils.ts'
-import { generateApp as _generateApp, createApp, invalidateAppStructure } from './app.ts'
+import { generateApp as _generateApp, assertNoCircularPluginDependencies, createApp, invalidateAppStructure } from './app.ts'
 import { checkForExternalConfigurationFiles } from './external-config-files.ts'
 import { createChangedFileFilter } from './template-dependencies.ts'
 import { cleanupCaches, getVueHash } from './cache.ts'
@@ -32,6 +32,10 @@ export async function build (nuxt: Nuxt): Promise<void> {
   const generateApp = debounce(() => _generateApp(nuxt, app), undefined, { leading: true })
   await generateApp()
   nuxt._perf?.endPhase('app:generate')
+
+  if (!nuxt.options.dev && !nuxt.options._prepare) {
+    await assertNoCircularPluginDependencies(nuxt, app.plugins)
+  }
 
   const builder = nuxt.options._prepare ? undefined : await resolveBuilder(nuxt)
 
@@ -343,9 +347,11 @@ async function createParcelWatcher () {
 }
 
 async function resolveBuilder (nuxt: Nuxt): Promise<NuxtBuilder> {
+  nuxt._perf?.startPhase('builder:import')
   const source = typeof nuxt.options.builder === 'string'
     ? await loadBuilder(nuxt, nuxt.options.builder)
     : nuxt.options.builder
+  nuxt._perf?.endPhase('builder:import')
 
   // Wrap `bundle` so the `build:error` hook fires for any builder, including
   // user-supplied ones, without each caller having to remember to do it.
