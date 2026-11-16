@@ -7,6 +7,7 @@ import type { Nuxt, NuxtConfig } from '@nuxt/schema'
 import type { Nitro, NitroConfig } from 'nitro/types'
 import { resolveModulePath } from 'exsolve'
 import { nitroBuildDiagnostics } from '../src/diagnostics.ts'
+import { RUNTIME_CONFIG_SCHEMA_ID } from '../src/runtime-config.ts'
 
 const fixtureDir = resolve(import.meta.dirname, '../../../test/fixtures/minimal')
 
@@ -17,6 +18,8 @@ const serverReplacements = {
   '__VUE_PROD_HYDRATION_MISMATCH_DETAILS__': 'false',
   'import.meta.test': 'false',
 }
+
+const getSchema = (nitro: Nitro) => JSON.parse((nitro.options.virtual[RUNTIME_CONFIG_SCHEMA_ID] as () => string)().replace(/^export default /, ''))
 
 const hasBundledVuePlugin = (nitroConfig: NitroConfig) => (nitroConfig.rollupConfig!.plugins as Array<{ name?: string }>).some(plugin => plugin?.name === 'nuxt:bundled-vue')
 
@@ -47,6 +50,22 @@ async function withNitro<T> (overrides: NuxtConfig, fn: (nitro: Nitro, nitroConf
 }
 
 describe('nitro config', () => {
+  it('infers the prerenderer\'s runtime config schema from its own runtime config', async () => {
+    await withNitro({ runtimeConfig: { assets: { dir: 'public' } } }, async (nitro) => {
+      const prerenderer = {
+        options: {
+          ...nitro.options,
+          runtimeConfig: { ...nitro.options.runtimeConfig, assets: { dir: ['public', 'layers/shared/public'] } },
+          virtual: { ...nitro.options.virtual },
+        },
+      } as unknown as Nitro
+      await nitro.hooks.callHook('prerender:init', prerenderer)
+
+      expect(getSchema(nitro).p.assets).toEqual({ p: { dir: 's' } })
+      expect(getSchema(prerenderer).p.assets).toEqual({ p: { dir: { a: 's' } } })
+    })
+  }, 60_000)
+
   it('emits valid rest-of-path URLPatterns for noScripts wildcard rules', async () => {
     await withNitro({ routeRules: { '/foo/*': { noScripts: true }, '/scripted/*': { ssr: true } } }, async (_nitro, nitroConfig) => {
       const rendererConfig = nitroConfig.virtual!['nuxt/internal/renderer-config'] as () => Promise<string>
@@ -189,6 +208,43 @@ describe('nitro config', () => {
       expect(await plugin.transform.call({}, code, join(fixtureDir, 'server/skipped/hello.ts'))).toBeUndefined()
     })
   })
+
+  it.for([
+    ['tsx', 'function dec<T> () { return (_method: () => unknown) => () => \'decorated\' as T }', '@dec<string>()'],
+    ['jsx', 'function dec () { return () => () => \'decorated\' }', '@dec()'],
+  ])('lowers decorators in `.%s` server files that contain JSX', async ([ext, declaration, decorator]) => {
+    await withNitro({ experimental: { decorators: true } }, async (_nitro, nitroConfig) => {
+      const id = join(fixtureDir, `server/api/decorated.${ext}`)
+      const babel = [nitroConfig.rollupConfig!.plugins].flat().find((plugin) => {
+        const { name, transform } = plugin as { name?: string, transform?: { filter: { id: RegExp } } }
+        return name === 'babel' && transform!.filter.id.test(id)
+      }) as { transform: { handler: (this: unknown, code: string, id: string) => Promise<{ code: string } | null> } }
+      const code = [
+        declaration,
+        `class Decorated { ${decorator} method () { return 'initial' } }`,
+        'export default () => <div>{new Decorated().method()}</div>',
+      ].join('\n')
+
+      const result = await babel.transform.handler.call({ error: (error: unknown) => { throw error } }, code, id)
+      expect(result!.code).not.toContain(decorator)
+      expect(result!.code).toContain('<div>{new Decorated().method()}</div>')
+    })
+  })
+
+  it('only runs babel on server modules with decorators', async () => {
+    await withNitro({ experimental: { decorators: true } }, async (_nitro, nitroConfig) => {
+      type BabelPlugin = { name?: string, transform: { handler: (code: string, id: string) => Promise<{ code: string } | null> } }
+      const plugins = [nitroConfig.rollupConfig!.plugins].flat().filter(plugin => (plugin as { name?: string } | null)?.name === 'babel') as BabelPlugin[]
+      const transform = (index: number, code: string, id: string) => plugins[index]!.transform.handler.call({ error: (e: unknown) => { throw e } }, code, join(fixtureDir, id))
+
+      expect(plugins).toHaveLength(2)
+      expect(await transform(0, 'import { a } from "@scope/pkg"\n/** @internal */\nexport const b = /*@__PURE__*/ a("user@example.com")', 'server/utils/a.ts')).toBeNull()
+      expect(await transform(1, 'export const C = () => <p title="user@example.com" />', 'server/utils/c.tsx')).toBeNull()
+      expect((await transform(0, 'const d = (v: unknown) => v\n@d class E {}', 'server/utils/e.ts'))?.code).not.toContain('@d')
+      expect((await transform(0, 'const d = <T>() => (v: T) => v\n@d<string>() class E {}', 'server/utils/f.ts'))?.code).not.toContain('@d')
+      expect((await transform(1, 'const d = (v: unknown) => v\n@d class E {}', 'server/utils/e.tsx'))?.code).not.toContain('@d')
+    })
+  }, 60_000)
 
   it('shares the `@rspack/core` of the app builder with the nitro `rspack` builder', async () => {
     await withNitro({ builder: 'rspack', nitro: { builder: 'rspack' } }, (nitro, nitroConfig) => {
