@@ -21,9 +21,10 @@ import { useRouteAnnouncer } from '#app/composables/route-announcer'
 import { useAnnouncer } from '#app/composables/announcer'
 import { encodeRoutePath, encodeURL, resolveRouteObject } from '#app/composables/router'
 import { useRuntimeHook } from '#app/composables/runtime-hook'
-import { loadPayload, shouldLoadPayload } from '#app/composables/payload'
+import { loadPayload, preloadPayload, shouldLoadPayload } from '#app/composables/payload'
 import { NuxtPage } from '#components'
 import routerOptions from '#build/router.options.mjs'
+import { navigateToDefaults } from '#build/nuxt.config.mjs'
 
 import { isTestingAppManifest } from '../matrix'
 
@@ -37,6 +38,18 @@ vi.mock('#build/nuxt.config.mjs', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
   payloadExtraction: true,
 }))
+
+const routeRulesMatcher = vi.hoisted(() => ({ calls: 0 }))
+vi.mock('#build/route-rules.mjs', async (importOriginal) => {
+  const original = await importOriginal<{ default: (path: string) => Record<string, any> }>()
+  return {
+    ...original,
+    default: (path: string) => {
+      routeRulesMatcher.calls++
+      return original.default(path)
+    },
+  }
+})
 
 describe('app config', () => {
   it('can be updated', () => {
@@ -841,6 +854,51 @@ describe('compiled route rules', () => {
       fetchSpy.mockRestore()
     }
   })
+
+  it('should match route rules once per payload load', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => Promise.resolve(new Response('[{"data":1},{}]')))
+    try {
+      routeRulesMatcher.calls = 0
+      await loadPayload('/pre/matched', { fresh: true })
+      expect(fetchSpy).toHaveBeenCalledOnce()
+      expect(routeRulesMatcher.calls).toBe(1)
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+
+  it('should add a single preload link per payload', async () => {
+    const links = () => [...document.head.querySelectorAll<HTMLLinkElement>('link[href*="/pre/preloaded/_payload.json"]')]
+
+    const first = preloadPayload('/pre/preloaded')
+    const second = preloadPayload('/pre/preloaded')
+    await vi.waitFor(() => expect(links()).toHaveLength(1))
+    links()[0]!.dispatchEvent(new Event('load'))
+    await Promise.all([first, second])
+    expect(links()).toHaveLength(0)
+
+    const retried = preloadPayload('/pre/preloaded')
+    await vi.waitFor(() => expect(links()).toHaveLength(1))
+    links()[0]!.dispatchEvent(new Event('load'))
+    await retried
+    expect(links()).toHaveLength(0)
+  })
+
+  it('should retry a payload preload that failed', async () => {
+    const links = () => [...document.head.querySelectorAll<HTMLLinkElement>('link[href*="/pre/unreachable/_payload.json"]')]
+
+    const failed = preloadPayload('/pre/unreachable')
+    await vi.waitFor(() => expect(links()).toHaveLength(1))
+    links()[0]!.dispatchEvent(new Event('error'))
+    await expect(failed).rejects.toBeUndefined()
+    expect(links()).toHaveLength(0)
+
+    const retried = preloadPayload('/pre/unreachable')
+    await vi.waitFor(() => expect(links()).toHaveLength(1))
+    links()[0]!.dispatchEvent(new Event('load'))
+    await retried
+    expect(links()).toHaveLength(0)
+  })
 })
 
 describe('useRuntimeHook', () => {
@@ -897,6 +955,8 @@ describe('routing utilities: `navigateTo`', () => {
     expect(() => navigateTo('https://test.com', { external: true })).not.toThrow()
     expect(() => navigateTo('/\t/test.com')).toThrow(expect.objectContaining({ code: 'NUXT_E2001' }))
     expect(() => navigateTo('/\n\\test.com')).toThrow(expect.objectContaining({ code: 'NUXT_E2001' }))
+    expect(() => navigateTo('https:test.com')).toThrow(expect.objectContaining({ code: 'NUXT_E2001' }))
+    expect(() => navigateTo('https:/test.com')).toThrow(expect.objectContaining({ code: 'NUXT_E2001' }))
   })
   it('navigateTo should disallow navigation to data/script URLs', () => {
     const urls = [
@@ -928,7 +988,7 @@ describe('routing utilities: `navigateTo`', () => {
     const open = vi.spyOn(window, 'open').mockImplementation(() => null)
     try {
       expect(() => navigateTo('https://example.com', { open: { target: '_blank' } })).not.toThrow()
-      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', '')
+      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', 'noopener=true')
     } finally {
       open.mockRestore()
     }
@@ -938,10 +998,32 @@ describe('routing utilities: `navigateTo`', () => {
     const open = vi.spyOn(window, 'open').mockImplementation(() => null)
     try {
       navigateTo('https://example.com', { open: {} })
-      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', '')
+      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', 'noopener=true')
     } finally {
       open.mockRestore()
     }
+  })
+
+  it('navigateTo should let explicit `noopener` override `experimental.defaults.navigateTo`', () => {
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const noopener = navigateToDefaults.noopener
+    onTestFinished(() => {
+      navigateToDefaults.noopener = noopener
+      open.mockRestore()
+    })
+
+    navigateTo('https://example.com', { open: { windowFeatures: { popup: true } } })
+    expect(open).toHaveBeenLastCalledWith('https://example.com', '_blank', 'popup=true, noopener=true')
+
+    navigateTo('https://example.com', { open: { windowFeatures: { noopener: false } } })
+    expect(open).toHaveBeenLastCalledWith('https://example.com', '_blank', 'noopener=false')
+
+    navigateToDefaults.noopener = false
+    navigateTo('https://example.com', { open: { windowFeatures: { popup: true } } })
+    expect(open).toHaveBeenLastCalledWith('https://example.com', '_blank', 'popup=true')
+
+    navigateTo('https://example.com', { open: {} })
+    expect(open).toHaveBeenLastCalledWith('https://example.com', '_blank', '')
   })
 
   it('navigateTo should respect app.baseURL when opening internal routes', () => {
@@ -951,13 +1033,13 @@ describe('routing utilities: `navigateTo`', () => {
     config.app.baseURL = '/docs/'
     try {
       navigateTo('/guide', { open: { target: '_blank' } })
-      expect(open).toHaveBeenCalledWith('/docs/guide', '_blank', '')
+      expect(open).toHaveBeenCalledWith('/docs/guide', '_blank', 'noopener=true')
 
       navigateTo({ path: '/guide' }, { open: { target: '_blank' } })
-      expect(open).toHaveBeenCalledWith('/docs/guide', '_blank', '')
+      expect(open).toHaveBeenCalledWith('/docs/guide', '_blank', 'noopener=true')
 
       navigateTo('https://example.com', { open: { target: '_blank' } })
-      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', '')
+      expect(open).toHaveBeenCalledWith('https://example.com', '_blank', 'noopener=true')
     } finally {
       config.app.baseURL = originalBaseURL
       open.mockRestore()
@@ -1087,7 +1169,7 @@ describe('routing utilities: `navigateTo`', () => {
         return navigateTo({ path: '/', query: { race: 'redirected' } })
       }
     })
-    addRouteMiddleware(middleware, { global: true })
+    const unregister = addRouteMiddleware(middleware, { global: true })
 
     try {
       const first = router.push({ path: '/', query: { race: 'first' } })
@@ -1098,12 +1180,92 @@ describe('routing utilities: `navigateTo`', () => {
       releaseSecond()
       await second
     } finally {
-      const globalMiddleware = useNuxtApp()._middleware.global
-      globalMiddleware.splice(globalMiddleware.indexOf(middleware), 1)
+      unregister()
     }
 
     expect(router.currentRoute.value.query.race).toBe('redirected')
     expect(router.currentRoute.value.redirectedFrom?.query.race).toBe('second')
+  })
+})
+
+describe('routing utilities: `addRouteMiddleware`', () => {
+  it('returns a function that unregisters global middleware', async () => {
+    const router = useRouter()
+    const visits: unknown[] = []
+    const unregister = addRouteMiddleware((to) => {
+      visits.push(to.query.unregister)
+    })
+    onTestFinished(unregister)
+    await router.push({ path: '/', query: { unregister: 'before' } })
+    unregister()
+    await router.push({ path: '/', query: { unregister: 'after' } })
+    expect(router.currentRoute.value.query.unregister).toBe('after')
+    expect(visits).toEqual(['before'])
+  })
+
+  it('removes a global middleware only once when unregister is called twice', () => {
+    const nuxtApp = useNuxtApp()
+    const middleware = () => {}
+    const unregister = addRouteMiddleware(middleware)
+    const unregisterAgain = addRouteMiddleware(middleware)
+    onTestFinished(unregisterAgain)
+    unregister()
+    unregister()
+    expect(nuxtApp._middleware.global.filter(mw => mw === middleware)).toHaveLength(1)
+  })
+
+  it('preserves registration order when unregistering a duplicate global middleware', () => {
+    const nuxtApp = useNuxtApp()
+    const first = () => {}
+    const second = () => {}
+    const unregisterFirst = addRouteMiddleware(first)
+    const unregisterSecond = addRouteMiddleware(second)
+    const unregisterDuplicate = addRouteMiddleware(first)
+    onTestFinished(() => {
+      unregisterFirst()
+      unregisterSecond()
+      unregisterDuplicate()
+    })
+    unregisterDuplicate()
+    expect(nuxtApp._middleware.global).toEqual([first, second])
+  })
+
+  it('returns a function that unregisters named middleware', () => {
+    const nuxtApp = useNuxtApp()
+    const middleware = () => {}
+    const unregister = addRouteMiddleware('test-named', middleware)
+    expect(nuxtApp._middleware.named['test-named']).toBe(middleware)
+    unregister()
+    expect(nuxtApp._middleware.named['test-named']).toBeUndefined()
+  })
+
+  it('does not remove named middleware that has since been replaced', () => {
+    const nuxtApp = useNuxtApp()
+    const first = () => {}
+    const second = () => {}
+    const unregister = addRouteMiddleware('test-named', first)
+    addRouteMiddleware('test-named', second)
+    onTestFinished(() => { delete nuxtApp._middleware.named['test-named'] })
+    unregister()
+    expect(nuxtApp._middleware.named['test-named']).toBe(second)
+  })
+
+  it('does not remove a named middleware that was re-registered when unregister is called again', () => {
+    const nuxtApp = useNuxtApp()
+    const middleware = () => {}
+    const unregister = addRouteMiddleware('test-named', middleware)
+    unregister()
+    addRouteMiddleware('test-named', middleware)
+    onTestFinished(() => { delete nuxtApp._middleware.named['test-named'] })
+    unregister()
+    expect(nuxtApp._middleware.named['test-named']).toBe(middleware)
+  })
+
+  it('removes a named middleware whose name collides with an Object prototype property', () => {
+    const nuxtApp = useNuxtApp()
+    const unregister = addRouteMiddleware('constructor', () => {})
+    unregister()
+    expect(nuxtApp._middleware.named.constructor).toBeUndefined()
   })
 })
 
@@ -1373,6 +1535,7 @@ describe('routing utilities: `abortNavigation`', () => {
   describe('aborted navigation', () => {
     const abortMiddleware = defineNuxtRouteMiddleware(to => to.query.abort ? abortNavigation() : undefined)
     let restoreRoutes = () => {}
+    let unregisterAbort = () => {}
 
     beforeEach(() => {
       const router = useRouter()
@@ -1387,12 +1550,11 @@ describe('routing utilities: `abortNavigation`', () => {
           router.addRoute(catchall)
         }
       }
-      addRouteMiddleware(abortMiddleware, { global: true })
+      unregisterAbort = addRouteMiddleware(abortMiddleware, { global: true })
     })
 
     afterEach(async () => {
-      const globalMiddleware = useNuxtApp()._middleware.global
-      globalMiddleware.splice(globalMiddleware.indexOf(abortMiddleware), 1)
+      unregisterAbort()
       await clearError()
       await navigateTo('/abort-matched')
       restoreRoutes()
@@ -1471,12 +1633,11 @@ describe('routing utilities: `setPageLayout`', () => {
         return navigateTo('/')
       }
     })
-    addRouteMiddleware(middleware, { global: true })
+    const unregister = addRouteMiddleware(middleware, { global: true })
     try {
       await router.push(targets[0]!)
     } finally {
-      const globalMiddleware = useNuxtApp()._middleware.global
-      globalMiddleware.splice(globalMiddleware.indexOf(middleware), 1)
+      unregister()
     }
     expect(route.fullPath).toBe('/')
     setPageLayout('custom')
