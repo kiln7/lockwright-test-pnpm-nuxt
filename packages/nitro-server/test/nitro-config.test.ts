@@ -1,7 +1,10 @@
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { isAbsolute, join, resolve } from 'pathe'
-import { directoryToURL, isNuxtMajorVersion, loadNuxt } from '@nuxt/kit'
+import { directoryToURL, isNuxtMajorVersion, loadNuxt, updateRuntimeConfig } from '@nuxt/kit'
+import { z } from 'zod'
 import { createNitro } from 'nitro/builder'
 import type { Nuxt, NuxtConfig } from '@nuxt/schema'
 import type { Nitro, NitroConfig } from 'nitro/types'
@@ -19,20 +22,32 @@ const serverReplacements = (nuxt: Nuxt) => ({
   'import.meta.test': 'false',
 })
 
-const getSchema = (nitro: Nitro) => JSON.parse((nitro.options.virtual[RUNTIME_CONFIG_SCHEMA_ID] as () => string)().replace(/^export default /, ''))
+const loadSchemaModule = (nitro: Nitro): Promise<{ default: Record<string, any>, strictPaths?: string[] }> =>
+  import(`data:text/javascript,${encodeURIComponent((nitro.options.virtual[RUNTIME_CONFIG_SCHEMA_ID] as () => string)())}`)
 
 const asNuxtMajor = (major: number) => (_options: unknown, nuxt: Nuxt) => {
   nuxt._version = `${major}.0.0`
 }
 
-const findH3RuntimePlugin = (nitroConfig: NitroConfig) => ([nitroConfig.rollupConfig!.plugins].flat() as Array<{ name?: string, resolveId: { handler: (id: string) => string | undefined } }>)
+const findH3RuntimePlugin = (nitroConfig: NitroConfig) => ([nitroConfig.rollupConfig!.plugins].flat() as Array<{ name?: string, resolveId: { handler: (id: string) => string | undefined | Promise<string | undefined> } }>)
   .find(plugin => plugin?.name === 'nuxt:nitro:h3-v1-runtime')
 
 async function findViteH3RuntimePlugin (nuxt: Nuxt) {
   const config = { environments: { ssr: {}, client: {} }, plugins: [] }
   await nuxt.callHook('vite:extend', { nuxt, config } as any)
-  return (config.plugins.flat() as Array<{ name?: string, applyToEnvironment: (environment: { name: string }) => boolean, resolveId: (id: string) => string | undefined }>)
+  return (config.plugins.flat() as Array<{ name?: string, applyToEnvironment: (environment: { name: string }) => boolean, resolveId: (id: string, importer?: string) => string | undefined }>)
     .find(plugin => plugin?.name === 'nuxt:nitro:h3-v1-runtime')
+}
+
+function h3Entry (major: '1' | '2') {
+  if (major === '2') {
+    return resolveModulePath('h3', { from: import.meta.url })
+  }
+  const dir = join(mkdtempSync(join(tmpdir(), 'nitro-h3-v1-')), 'node_modules/h3')
+  mkdirSync(join(dir, 'dist'), { recursive: true })
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'h3', version: '1.15.11', exports: { '.': { types: './dist/index.d.ts', import: './dist/index.mjs', require: './dist/index.cjs' } } }))
+  writeFileSync(join(dir, 'dist/index.mjs'), '')
+  return join(dir, 'dist/index.mjs')
 }
 
 const hasBundledVuePlugin = (nitroConfig: NitroConfig) => (nitroConfig.rollupConfig!.plugins as Array<{ name?: string }>).some(plugin => plugin?.name === 'nuxt:bundled-vue')
@@ -76,10 +91,35 @@ describe('nitro config', () => {
       } as unknown as Nitro
       await nitro.hooks.callHook('prerender:init', prerenderer)
 
-      expect(getSchema(nitro).p.assets).toEqual({ p: { dir: 's' } })
-      expect(getSchema(prerenderer).p.assets).toEqual({ p: { dir: { a: 's' } } })
+      expect((await loadSchemaModule(nitro)).default.p.assets).toEqual({ p: { dir: 's' } })
+      expect((await loadSchemaModule(prerenderer)).default.p.assets).toEqual({ p: { dir: { a: 's' } } })
     })
   }, 60_000)
+
+  it.for([
+    [4, 4, ['apiSecret']],
+    [4, 5, undefined],
+    [5, 5, undefined],
+  ] as const)('emits the strict runtime config paths of a Nuxt %i app with `compatibilityVersion: %i`', async ([major, compatibilityVersion, strictPaths]) => {
+    const schemaModule = (_options: unknown, nuxt: Nuxt) => {
+      nuxt._version = `${major}.0.0`
+      ;(nuxt.options.future as { compatibilityVersion: number }).compatibilityVersion = compatibilityVersion
+      updateRuntimeConfig({ moduleToken: z.string().default('token') })
+    }
+    await withNitro({ modules: [schemaModule], runtimeConfig: { apiSecret: z.string().default('secret') } as NuxtConfig['runtimeConfig'] }, async (nitro) => {
+      const { default: schema, strictPaths: emitted } = await loadSchemaModule(nitro)
+      expect(Object.keys(schema.p)).toEqual(expect.arrayContaining(['apiSecret', 'moduleToken']))
+      expect(emitted).toEqual(strictPaths)
+    })
+  })
+
+  it.for([true, false])('registers routes at the root for a relative `app.baseURL` when static is %s', async (isStatic) => {
+    await withNitro({ app: { baseURL: './' }, nitro: { static: isStatic } }, (nitro, _nitroConfig, nuxt) => {
+      expect(nuxt.options.app.baseURL).toBe('./')
+      expect(nitro.options.baseURL).toBe('/')
+      expect(nitro.routing.routeRules.routes.map(route => route.route)).toContain('/**')
+    })
+  })
 
   it('emits valid rest-of-path URLPatterns for noScripts wildcard rules', async () => {
     await withNitro({ routeRules: { '/foo/*': { noScripts: true }, '/scripted/*': { ssr: true } } }, async (_nitro, nitroConfig) => {
@@ -141,6 +181,19 @@ describe('nitro config', () => {
     })
     await withNitro({ dev: false, vue: { runtimeCompiler: true } }, (_nitro, nitroConfig) => {
       expect(hasBundledVuePlugin(nitroConfig)).toBe(false)
+    })
+  })
+
+  it.for(['webpack:config', 'rspack:config'] as const)('aliases vue to the esm-bundler build in a client config without `resolve.alias` on `%s`', async (hook) => {
+    await withNitro({ vue: { runtimeCompiler: true } }, async (_nitro, _nitroConfig, nuxt) => {
+      const configs = [{ name: 'client' }, { name: 'client', resolve: {} }]
+      for (const config of configs) {
+        await nuxt.callHook(hook, [config] as any)
+      }
+      expect(configs.map(config => config.resolve)).toEqual([
+        { alias: { vue: 'vue/dist/vue.esm-bundler' } },
+        { alias: { vue: 'vue/dist/vue.esm-bundler' } },
+      ])
     })
   })
 
@@ -295,24 +348,45 @@ describe('nitro config', () => {
     })
   })
 
-  it('resolves the h3 v1 helpers of a Nuxt 4 app to the h3 v1 shim', async () => {
-    await withNitro({ modules: [asNuxtMajor(4)] }, async (_nitro, nitroConfig, nuxt) => {
+  it('resolves the h3 v1 helpers of a Nuxt 4 app to the app h3 v1 shim', async () => {
+    await withNitro({ modules: [asNuxtMajor(4)], nitroLegacy: { h3: false } }, async (_nitro, nitroConfig, nuxt) => {
       const plugin = findH3RuntimePlugin(nitroConfig)
       const entry = resolveModulePath('@nuxt/nitro-server/h3', { from: directoryToURL(nuxt.options.appDir) })
-      expect(nitroConfig.alias!['@nuxt/nitro-server/h3']).toMatch(/runtime\/compat\/h3-v1/)
-      expect(plugin!.resolveId.handler(entry)).toMatch(/runtime\/compat\/h3-v1/)
-      expect(plugin!.resolveId.handler('h3')).toBeUndefined()
+      expect(nitroConfig.alias!['@nuxt/nitro-server/h3']).toMatch(/runtime\/compat\/h3-v1-app\.[mt]s$/)
+      expect(await plugin!.resolveId.handler(entry)).toMatch(/runtime\/compat\/h3-v1-app\.[mt]s$/)
+      expect(await plugin!.resolveId.handler('h3')).toBeUndefined()
+      expect(await plugin!.resolveId.handler(h3Entry('1'))).toBeUndefined()
 
       const vitePlugin = await findViteH3RuntimePlugin(nuxt)
       expect(vitePlugin!.applyToEnvironment({ name: 'ssr' })).toBe(true)
       expect(vitePlugin!.applyToEnvironment({ name: 'client' })).toBe(false)
-      expect(vitePlugin!.resolveId('@nuxt/nitro-server/h3')).toMatch(/runtime\/compat\/h3-v1/)
-      expect(vitePlugin!.resolveId('h3')).toBeUndefined()
+      expect(vitePlugin!.resolveId('@nuxt/nitro-server/h3')).toMatch(/runtime\/compat\/h3-v1-app\.[mt]s$/)
+      expect(vitePlugin!.resolveId('h3', join(nuxt.options.srcDir, 'components/Test.vue'))).toBeUndefined()
+    })
+  })
+
+  it('resolves `h3` in the server build of a Nuxt 4 app to the app h3 v1 shim with `nitroLegacy.h3`', async () => {
+    await withNitro({ modules: [asNuxtMajor(4)], nitroLegacy: { h3: true } }, async (_nitro, nitroConfig, nuxt) => {
+      const appShim = /runtime\/compat\/h3-v1-app\.[mt]s$/
+      const vitePlugin = await findViteH3RuntimePlugin(nuxt)
+      expect(vitePlugin!.applyToEnvironment({ name: 'client' })).toBe(false)
+      expect(vitePlugin!.resolveId('h3', join(nuxt.options.srcDir, 'components/Test.vue'))).toMatch(appShim)
+      expect(vitePlugin!.resolveId('h3', '/project/node_modules/some-module/dist/runtime/components/Test.vue')).toMatch(appShim)
+      expect(vitePlugin!.resolveId('h3', '/project/node_modules/nitro/lib/h3.mjs')).toBeUndefined()
+      expect(vitePlugin!.resolveId('h3', '/project/node_modules/.pnpm/h3@2.0.0/node_modules/h3/dist/index.mjs')).toBeUndefined()
+      expect(vitePlugin!.resolveId('h3/rules', join(nuxt.options.srcDir, 'components/Test.vue'))).toBeUndefined()
+
+      const plugin = findH3RuntimePlugin(nitroConfig)
+      expect(nitroConfig.alias!.h3).toBeUndefined()
+      expect(await plugin!.resolveId.handler('h3')).toBeUndefined()
+      expect(await plugin!.resolveId.handler(h3Entry('1'))).toMatch(appShim)
+      expect(await plugin!.resolveId.handler(h3Entry('2'))).toMatch(appShim)
+      expect(await plugin!.resolveId.handler(resolveModulePath('h3/rules', { from: import.meta.url }))).toBeUndefined()
     })
   })
 
   it('leaves the h3 helpers of a Nuxt 5 app unaliased', async () => {
-    await withNitro({ modules: [asNuxtMajor(5)] }, async (_nitro, nitroConfig, nuxt) => {
+    await withNitro({ modules: [asNuxtMajor(5)], nitroLegacy: true }, async (_nitro, nitroConfig, nuxt) => {
       expect(nitroConfig.alias!['@nuxt/nitro-server/h3']).toBeUndefined()
       expect(findH3RuntimePlugin(nitroConfig)).toBeUndefined()
       expect(await findViteH3RuntimePlugin(nuxt)).toBeUndefined()
@@ -343,4 +417,18 @@ describe('nitro config', () => {
       expect(nuxt.options.vite.plugins?.flat().filter(isImpound) ?? []).toHaveLength(0)
     })
   })
+
+  it('lets dev error reports read the server bundle the vite dev server denies', async () => {
+    const buildDir = await mkdtemp(join(tmpdir(), 'nuxt-[dev](x)@-'))
+    onTestFinished(() => rm(buildDir, { recursive: true, force: true }))
+    await withNitro({ dev: true, buildDir }, async (nitro, _nitroConfig, nuxt) => {
+      const outputPattern = `${resolve(nitro.options.output.serverDir).replace(/[\\*?[\]{}()!+@|]/g, '\\$&')}/**`
+      const fs = { allow: [nuxt.options.rootDir], deny: ['.env', '**/app-secret', outputPattern], strict: true }
+      await nuxt.callHook('vite:serverCreated', { config: { server: { fs, allowedHosts: [] } } } as any, { isClient: true, isServer: false })
+
+      const options = await (nitro.options.virtual['#internal/dev-server-logs-options'] as () => string)()
+      const reportFs = JSON.parse(/^export const reportFs = (.+);$/m.exec(options)![1]!)
+      expect(reportFs).toEqual({ ...fs, deny: ['.env', '**/app-secret'] })
+    })
+  }, 60_000)
 })

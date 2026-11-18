@@ -16,6 +16,7 @@ import { guardedServerConfig } from './internal/runtime-config'
 import type { PrefetchScheduler } from './internal/prefetch'
 import type { LoadingIndicator } from './composables/loading-indicator'
 import type { NuxtAnnouncer } from './composables/announcer'
+import type { ClientHeadState } from '../head/runtime/client-head-state'
 import type { AppConfig, AppConfigInput, NuxtHookCallback, NuxtHookRegistry, RuntimeConfig } from 'nuxt/schema'
 
 import { appDiagnostics } from './diagnostics/core'
@@ -168,6 +169,9 @@ interface _NuxtApp {
   '_routeAnnouncerDeps'?: number
 
   /** @internal */
+  '~head'?: ClientHeadState
+
+  /** @internal */
   '~transitionPromise'?: Promise<void>
   /** @internal */
   '~transitionFinish'?: () => void
@@ -181,6 +185,8 @@ interface _NuxtApp {
   '$config': RuntimeConfig
 
   'isHydrating'?: boolean
+  /** @internal */
+  '_appCreated'?: boolean
   'deferHydration': () => () => void | Promise<void>
 
   'ssrContext'?: NuxtSSRContext
@@ -381,6 +387,8 @@ export function createNuxtApp (options: CreateOptions): NuxtApp {
     }
     window.useNuxtApp ||= useNuxtApp
 
+    nuxtApp.hooks.hook('app:created', () => { nuxtApp._appCreated = true })
+
     // Log errors captured when running plugins, in the `app:created` and `app:beforeMount` hooks
     // as well as when mounting the app.
     const unreg = nuxtApp.hook('app:error', (...args) => {
@@ -560,8 +568,8 @@ export function callWithNuxt<T extends (...args: any[]) => any> (nuxt: NuxtApp |
  * Returns `null` if Nuxt instance is unavailable.
  * @since 3.10.0
  */
-/* @__NO_SIDE_EFFECTS__ */
 export function tryUseNuxtApp (): NuxtApp | null
+/* @__NO_SIDE_EFFECTS__ */
 export function tryUseNuxtApp (id?: string): NuxtApp | null {
   let nuxtAppInstance
   if (hasInjectionContext()) {
@@ -579,8 +587,8 @@ export function tryUseNuxtApp (id?: string): NuxtApp | null {
  * Throws an error if Nuxt instance is unavailable.
  * @since 3.0.0
  */
-/* @__NO_SIDE_EFFECTS__ */
 export function useNuxtApp (): NuxtApp
+/* @__NO_SIDE_EFFECTS__ */
 export function useNuxtApp (id?: string): NuxtApp {
   // @ts-expect-error internal usage of id
   const nuxtAppInstance = tryUseNuxtApp(id)

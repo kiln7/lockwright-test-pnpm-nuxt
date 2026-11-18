@@ -2,7 +2,7 @@ import { lstat, symlink, unlink } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { matchesGlob } from 'node:path'
 import { dirname, isAbsolute, normalize, relative, resolve } from 'pathe'
-import { withTrailingSlash } from 'ufo'
+import { withTrailingSlash, withoutTrailingSlash } from 'ufo'
 import escapeRE from 'escape-string-regexp'
 import type { Nuxt } from '@nuxt/schema'
 
@@ -55,6 +55,20 @@ export const PATHS_SPECIFIER = '#internal/nuxt/paths'
 export const nitroImplicitDependencies = ['nitro', 'h3', 'srvx', 'defu', 'consola', 'ofetch', 'crossws']
 
 export const GLOB_SUFFIX_RE = /\/[^/*]*\*[\s\S]*$/
+
+const GLOB_SPECIAL_CHARS_RE = /[\\*?[\]{}()!+@|]/g
+
+/**
+ * Drop the `server.fs.deny` pattern for Nitro's dev output, which dev error reports
+ * read to map frames through the server bundle's source map.
+ */
+export function withoutServerDirDeny (deny: string[], serverDir: string | undefined): string[] {
+  if (!serverDir) {
+    return deny
+  }
+  const pattern = `${resolve(serverDir).replace(GLOB_SPECIAL_CHARS_RE, '\\$&')}/**`
+  return deny.filter(entry => entry !== pattern)
+}
 
 export function toArray<T> (value: T | T[]): T[] {
   return Array.isArray(value) ? value : [value]
@@ -119,8 +133,8 @@ export function toTranspileNoExternal (entry: string): string | RegExp {
   if (!isAbsolute(entry)) {
     return entry
   }
-  const dir = escapeRE(normalize(entry)).replace(/\//g, '[\\\\/]')
-  return new RegExp(`^${dir}(?!.*[\\\\/]node_modules[\\\\/])`)
+  const dir = escapeRE(withoutTrailingSlash(normalize(entry))).replace(/\//g, '[\\\\/]')
+  return new RegExp(`^${dir}(?=[\\\\/]|$)(?!.*[\\\\/]node_modules[\\\\/])`)
 }
 
 /**

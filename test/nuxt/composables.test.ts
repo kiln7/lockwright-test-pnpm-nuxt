@@ -5,10 +5,14 @@ import { defineEventHandler } from 'h3'
 import { mountSuspended, registerEndpoint } from '@nuxt/test-utils/runtime'
 import { hasProtocol } from 'ufo'
 import { NavigationFailureType, isNavigationFailure } from 'vue-router'
+import { createApp, inject } from 'vue'
+import { headSymbol } from '@unhead/vue'
 
 import * as composables from '#app/composables'
 import { _showErrorUnlessCrawler, clearError, showError, useError } from '#app/composables/error'
 import { useNuxtApp } from '#app/nuxt'
+import type { NuxtApp } from '#app/nuxt'
+import { injectHead, useHead, useServerHead, useServerHeadSafe, useServerSeoMeta } from '#app/composables/head'
 import * as idleCallback from '#app/compat/idle-callback'
 import { onNuxtReady } from '#app/composables/ready'
 import { setResponseStatus, useRequestEvent, useRequestFetch, useRequestHeaders, useResponseHeader } from '#app/composables/ssr'
@@ -282,19 +286,97 @@ describe('ssr composables', () => {
     expect(prerenderRoutes('/')).toBeUndefined()
     expect(useResponseHeader('x-test').value).toBeUndefined()
   })
+
+  it('do not add server-only head entries on client', async () => {
+    await mountSuspended(defineComponent({
+      setup () {
+        useHead({ meta: [{ name: 'client-head', content: 'client' }] })
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        useServerHead({ meta: [{ name: 'server-head', content: 'server' }] })
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        useServerHeadSafe({ meta: [{ name: 'server-head-safe', content: 'server' }] })
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        useServerSeoMeta({ author: 'server' })
+        return () => h('div')
+      },
+    }))
+    onTestFinished(() => document.querySelector('meta[name="client-head"]')?.remove())
+
+    await vi.waitFor(() => {
+      expect(document.querySelector('meta[name="client-head"]')?.getAttribute('content')).toBe('client')
+    })
+
+    expect(document.querySelector('meta[name="server-head"]')).toBeNull()
+    expect(document.querySelector('meta[name="server-head-safe"]')).toBeNull()
+    expect(document.querySelector('meta[name="author"]')).toBeNull()
+  })
+
+  it('returns an inert head entry on client', () => {
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    const headEntry = useServerHead({ meta: [{ name: 'server-head', content: 'server' }] })
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    const headSafeEntry = useServerHeadSafe({ meta: [{ name: 'server-head-safe', content: 'server' }] })
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    const seoEntry = useServerSeoMeta({ author: 'server' })
+
+    for (const entry of [headEntry, headSafeEntry, seoEntry]) {
+      expect(entry._i).toBe(-1)
+      entry.patch({})
+      entry.dispose()
+    }
+  })
 })
 
 describe('useHydration', () => {
+  let nuxtApp: ReturnType<typeof useNuxtApp>
+  let initialState: { appCreated: boolean | undefined, isHydrating: boolean | undefined }
+
+  beforeEach(() => {
+    nuxtApp = useNuxtApp()
+    initialState = {
+      appCreated: nuxtApp._appCreated,
+      isHydrating: nuxtApp.isHydrating,
+    }
+  })
+
+  afterEach(() => {
+    nuxtApp._appCreated = initialState.appCreated
+    nuxtApp.isHydrating = initialState.isHydrating
+    delete nuxtApp.payload.key
+  })
+
   it('should hydrate value from payload', async () => {
+    nuxtApp._appCreated = false
     let val: any
-    const nuxtApp = useNuxtApp()
     useHydration('key', () => {}, (fromPayload) => { val = fromPayload })
-    await nuxtApp.hooks.callHook('app:created', nuxtApp.vueApp)
-    expect(val).toMatchInlineSnapshot('undefined')
+    expect(val).toBeUndefined()
 
     nuxtApp.payload.key = 'from payload'
     await nuxtApp.hooks.callHook('app:created', nuxtApp.vueApp)
-    expect(val).toMatchInlineSnapshot('"from payload"')
+    expect(val).toBe('from payload')
+  })
+
+  it('should hydrate immediately when registered during hydration after the app has been created', async () => {
+    nuxtApp._appCreated = false
+    await nuxtApp.hooks.callHook('app:created', nuxtApp.vueApp)
+    nuxtApp.isHydrating = true
+    nuxtApp.payload.key = 'late registration'
+
+    let val: any
+    useHydration('key', () => {}, (fromPayload) => { val = fromPayload })
+    expect(val).toBe('late registration')
+  })
+
+  it('should not apply the initial payload when registered after hydration', async () => {
+    nuxtApp._appCreated = false
+    await nuxtApp.hooks.callHook('app:created', nuxtApp.vueApp)
+    nuxtApp.isHydrating = false
+    nuxtApp.payload.key = 'stale'
+
+    const set = vi.fn()
+    useHydration('key', () => {}, set)
+    await nuxtApp.hooks.callHook('app:created', nuxtApp.vueApp)
+    expect(set).not.toHaveBeenCalled()
   })
 })
 
@@ -1809,5 +1891,17 @@ describe('namespace access to useNuxtApp', () => {
 
   it('should throw an error when used with wrong appId', () => {
     expect(() => useNuxtApp('nuxt-app-unknown')).toThrow()
+  })
+})
+
+describe('injectHead', () => {
+  it('creates and provides the client head on first use', () => {
+    const vueApp = createApp({ render: () => null })
+    const nuxtApp = { vueApp, runWithContext: (fn: () => unknown) => vueApp.runWithContext(fn) } as unknown as NuxtApp
+
+    expect(vueApp.runWithContext(() => inject(headSymbol, null))).toBeNull()
+    const head = injectHead(nuxtApp)
+    expect(injectHead(nuxtApp)).toBe(head)
+    expect(vueApp.runWithContext(() => inject(headSymbol))).toBe(head)
   })
 })
