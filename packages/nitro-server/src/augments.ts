@@ -1,7 +1,8 @@
 /// <reference path="./internal.d.ts" />
-import type { Nitro, NitroConfig, NitroDevEventHandler, NitroEventHandler, NitroOptions, NitroRuntimeConfig, TracingChannelOptions as NitroTracingChannelOptions, NormalizedRouteRules, RouteRuleConfig } from 'nitro/types'
-import type { EventHandler, H3Event } from 'nitro/h3'
+import type { CachedHandlerOptions, Nitro, NitroConfig, NitroDevEventHandler, NitroEventHandler, NitroOptions, NitroRuntimeConfig, TracingChannelOptions as NitroTracingChannelOptions, NormalizedRouteRules, RouteRuleConfig } from 'nitro/types'
+import type { EventHandler, EventHandlerRequest, EventHandlerResponse, H3Event } from 'nitro/h3'
 import type { NitroLegacyOptions } from './compat.ts'
+import type { CachedEventHandler } from './runtime/compat/cache.ts'
 import type { DevServerLog, NuxtIslandContext, NuxtIslandResponse, NuxtRenderChunkContext, NuxtRenderCloseContext, NuxtRenderDocumentContext, NuxtRenderHTMLContext, NuxtRenderRouteContext } from '#app/types'
 import type { NitroServerHost, NuxtRequestContext, RouteRuleConfigExtensions, RuntimeConfig, ServerImportsOptions, TracingChannelOptions } from 'nuxt/schema'
 
@@ -142,8 +143,8 @@ declare module '@nuxt/schema' {
      * Transitional: this option and the compatibility layer behind it are removed in
      * Nuxt 6. Prefer importing from `nuxt/server`.
      *
-     * @note Enabling this, or installing any module whose server code imports from `h3`
-     * or `nitropack`, also turns on Nitro v2 error-shape recovery app-wide: an error
+     * @note Enabling this, or installing any module whose server code gets the
+     * compatibility layer, also turns on Nitro v2 error-shape recovery app-wide: an error
      * thrown as `{ statusCode, statusMessage }` keeps that status instead of being
      * scrubbed to a 500.
      *
@@ -184,8 +185,8 @@ declare module 'nuxt/schema' {
      * Transitional: this option and the compatibility layer behind it are removed in
      * Nuxt 6. Prefer importing from `nuxt/server`.
      *
-     * @note Enabling this, or installing any module whose server code imports from `h3`
-     * or `nitropack`, also turns on Nitro v2 error-shape recovery app-wide: an error
+     * @note Enabling this, or installing any module whose server code gets the
+     * compatibility layer, also turns on Nitro v2 error-shape recovery app-wide: an error
      * thrown as `{ statusCode, statusMessage }` keeps that status instead of being
      * scrubbed to a 500.
      *
@@ -221,6 +222,11 @@ declare module 'h3' {
   interface H3EventContext {
     nuxt?: NuxtRequestContext
   }
+}
+
+declare module 'nitro/cache' {
+  /** Cache a handler, keeping the type of what it returns as the body of the `Response` it serves. */
+  export function defineCachedHandler<RequestT extends EventHandlerRequest = EventHandlerRequest, ResponseT = EventHandlerResponse> (handler: EventHandler<RequestT, ResponseT>, opts?: CachedHandlerOptions): CachedEventHandler<RequestT, ResponseT>
 }
 
 export {}

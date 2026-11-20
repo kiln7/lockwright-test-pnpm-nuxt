@@ -23,7 +23,7 @@ import { resolveModulePath } from 'exsolve'
 import { runtimeDependencies } from 'nitro/meta'
 
 import nitroBuilder from '../package.json' with { type: 'json' }
-import { GLOB_SUFFIX_RE, NON_JS_FILE_RE, PATHS_SPECIFIER, distDir, getLayerNodeModulesExcludePattern, getServerReplacements, getSsrResolveConditions, nitroImplicitDependencies, relativeWithDot, timePluginHooks, toArray, toFsDriverIgnorePatterns, toModulePackageDir, toTranspileNoExternal, withoutServerDirDeny } from './utils.ts'
+import { GLOB_SUFFIX_RE, NON_JS_FILE_RE, PATHS_SPECIFIER, distDir, getLayerNodeModulesExcludePattern, getServerReplacements, getSsrResolveConditions, nitroImplicitDependencies, relativeWithDot, timePluginHooks, toArray, toFsDriverIgnorePatterns, toModulePackageDir, toTranspileNoExternal, withoutServerDirDeny, withoutWasmConditions } from './utils.ts'
 import { setupAppManifest, setupPayloadRouteRules } from './app-manifest.ts'
 import { canReuseSsrBuild, setupNitroViteEnvironment } from './vite.ts'
 import { setupLegacyDevAndBuild } from './legacy.ts'
@@ -141,21 +141,6 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
   for (const asset of [...nuxt.options.nitro.publicAssets || [], ...nuxt.options.nitro.serverAssets || []]) {
     if (asset?.dir) {
       asset.dir = resolveAlias(asset.dir, nuxt.options.alias)
-    }
-  }
-
-  // a missing `dir` is otherwise silent: nitro registers the base URL and serves a hard 404 from it
-  for (const asset of nuxt.options.nitro.publicAssets || []) {
-    if (!asset?.dir) { continue }
-    const dir = resolve(nuxt.options.rootDir, asset.dir)
-    // dirs within the build dir are generated later in the build
-    const isGenerated = !relative(nuxt.options.buildDir, dir).startsWith('..')
-    if (!existsSync(dir) && !isGenerated) {
-      bundlerDiagnostics.NUXT_B7023({
-        dir,
-        baseURL: joinURL('/', asset.baseURL || '/', '**'),
-        resolvedFrom: 'your project root',
-      })
     }
   }
 
@@ -287,7 +272,8 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
   const serverBundler = nuxt.options.experimental.nitroViteEnvironment ? 'vite' : requestedBuilder
   const rspackPath = serverBundler === 'rspack' ? resolveAppBuilderDependency(nuxt, '@rspack/core') : undefined
 
-  const nitroConfig: NitroConfig = defu(nuxt.options.nitro, {
+  // `noExternals: false` adds nothing to the entries below, which the server build needs
+  const nitroConfig: NitroConfig = defu({ ...nuxt.options.nitro, noExternals: nuxt.options.nitro.noExternals || undefined }, {
     debug: nuxt.options.debug ? nuxt.options.debug.nitro : false,
     rootDir: nuxt.options.rootDir,
     workspaceDir: nuxt.options.workspaceDir,
@@ -851,6 +837,22 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
   }, nuxt)
   await nuxt.callHook('nitro:init', nitro)
 
+  // a missing `dir` is otherwise silent: nitro registers the base URL and serves a hard 404 from it
+  nitro.hooks.hook('build:config', () => {
+    for (const asset of nitro.options.publicAssets || []) {
+      if (!asset?.dir) { continue }
+      // dirs within the build dir are generated later in the build
+      const isGenerated = !relative(nuxt.options.buildDir, asset.dir).startsWith('..')
+      if (!existsSync(asset.dir) && !isGenerated) {
+        bundlerDiagnostics.NUXT_B7023({
+          dir: asset.dir,
+          baseURL: joinURL('/', asset.baseURL || '/', '**'),
+          resolvedFrom: 'your project root',
+        })
+      }
+    }
+  })
+
   // Modules add aliases from `nitro:init`, and Nitro v3 resolves them in
   // insertion order, so a short prefix registered first shadows a longer key.
   nitro.options.alias = sortAliasesByPrecedence(nitro.options.alias)
@@ -886,7 +888,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
         // nitro's vite environment sets conditions for its dev runner (`workerd` excludes `node`)
         config.resolve.conditions = nuxt.options.experimental.nitroViteEnvironment && config.resolve.conditions
           ? getSsrResolveConditions(config.resolve.conditions)
-          : getSsrResolveConditions(config.resolve.conditions, nitro.options.exportConditions)
+          : getSsrResolveConditions(config.resolve.conditions, withoutWasmConditions(nitro.options.exportConditions))
       }
     },
   })
@@ -1049,6 +1051,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
       body: 'RequestBodyOf',
       query: 'RequestQueryOf',
       headers: 'RequestHeadersOf',
+      response: 'ResponseBodyOf',
     }
 
     for (const handler of [...nitro.scannedHandlers, ...nitro.options.handlers]) {

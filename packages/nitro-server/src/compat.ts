@@ -28,19 +28,23 @@ import { migratedPlugins, serverApiOf } from './registrations.ts'
  */
 export interface NitroLegacyOptions {
   /**
-   * Register the Nitro v2 auto-import names (`defineNitroPlugin`, `cachedEventHandler`, `useEvent`, …)
-   * and auto-import from subdirectories of `server/utils/`.
+   * Turn on the server auto-imports (as `experimental.nitroAutoImports` does), register the Nitro v2
+   * auto-import names (`defineNitroPlugin`, `cachedEventHandler`, `useEvent`, …) and auto-import from
+   * subdirectories of `server/utils/`.
    */
   imports?: boolean
-  /** Resolve `h3` to the bundled h3 v1 helpers in server code and, on Nuxt 4, in the server build of the app. */
+  /**
+   * Resolve `h3` to the bundled h3 v1 helpers in server code and, on Nuxt 4, in the server build of
+   * the app, and remove server aliases that point `h3` at h3 v1.
+   */
   h3?: boolean
   /** Resolve `nitropack`, `nitropack/runtime` and `#internal/nitro` to their Nitro v3 equivalents. */
   specifiers?: boolean
   /** Support the `useRuntimeConfig(event)` signature and its per-request semantics. */
   runtimeConfig?: boolean
   /**
-   * Accept Nitro v2 config shapes (handlers without a `route`), keep dotted suffixes in
-   * server file names that Nitro v3 rejects, and warn about removed options.
+   * Accept Nitro v2 config shapes (handlers without a `route`) and keep dotted suffixes in
+   * server file names that Nitro v3 rejects.
    */
   config?: boolean
 }
@@ -289,6 +293,25 @@ function resolveH3V1Version (dir: string, versions: Map<string, string | undefin
   return versions.get(manifest)
 }
 
+/** The version of h3 v1 that `file` belongs to, read from the `package.json` of its package. */
+function resolveH3V1PackageVersion (file: string, versions: Map<string, string | undefined>): string | undefined {
+  const { dir, name } = parseNodeModulePath(file)
+  if (!dir || !name) {
+    return
+  }
+  const manifest = join(dir, name, 'package.json')
+  if (!versions.has(manifest)) {
+    let pkg: { name?: string, version?: string } | undefined
+    try {
+      pkg = JSON.parse(readFileSync(manifest, 'utf8'))
+    } catch {
+      pkg = undefined
+    }
+    versions.set(manifest, pkg?.name === 'h3' && pkg.version?.startsWith('1.') ? pkg.version : undefined)
+  }
+  return versions.get(manifest)
+}
+
 const H3_ALIAS_RE = /^h3(?:\/|$)/
 
 /**
@@ -307,8 +330,9 @@ function dropH3V1Aliases (nuxt: Nuxt, nitroConfig: NitroConfig): string[] {
       continue
     }
     const { [key]: _, ...others } = aliases
-    const file = normalize(resolveAlias(target, others))
-    const version = isAbsolute(file) && parseNodeModulePath(file).name === 'h3' ? resolveH3V1Version(file, versions) : undefined
+    const resolved = normalize(resolveAlias(target, others))
+    const file = isAbsolute(resolved) ? resolved : resolveModulePath(resolved, { from: withTrailingSlash(nuxt.options.rootDir), try: true })
+    const version = file ? resolveH3V1PackageVersion(file, versions) : undefined
     if (!version) {
       continue
     }
