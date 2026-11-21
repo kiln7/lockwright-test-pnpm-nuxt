@@ -26,6 +26,8 @@ overrides:
   rolldown: "1.2.19"
   vite: "8.3.8"
   vue: "3.5.45"
+  'sharp@>=0.34.0 <0.35.0': '^0.35.5' # lockwright: GHSA-f88m-g3jw-g9cj, GHSA-rgj7-g3m4-5g8c, GHSA-wq5f-xc86-pv6w
+  'sharp@>=0.35.0 <0.35.5': '^0.35.5' # lockwright: GHSA-f88m-g3jw-g9cj, GHSA-rgj7-g3m4-5g8c, GHSA-wq5f-xc86-pv6w
 
 allowBuilds:
   '@parcel/watcher': true
