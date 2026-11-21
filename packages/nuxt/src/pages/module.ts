@@ -11,7 +11,7 @@ import { linkToAlias, logger } from '../utils.ts'
 import picomatch from 'picomatch'
 import { addRoute, createRouter, findRoute } from 'rou3'
 import { rou3PatternToURLPattern } from 'unrouting'
-import { resolvePagesRoutes as _resolvePagesRoutes, augmentAndResolve, createPagesContext, normalizeRoutes, resolveRoutePaths } from './utils.ts'
+import { resolvePagesRoutes as _resolvePagesRoutes, augmentAndResolve, createPagesContext, invalidatePageSymlink, normalizeRoutes, resolveRoutePaths } from './utils.ts'
 import type { PagesContext } from './utils.ts'
 import { resolvePageMetaExtractionKeys, shouldExtractSerializablePageMeta } from './page-meta-extraction.ts'
 import { collectRou3PagePatterns, collectRou3PageSources, toRou3RoutePatterns } from './route-patterns.ts'
@@ -177,7 +177,7 @@ export default defineNuxtModule({
 
     if (nuxt.options.dev && options.enabled) {
       // Add plugin to check if pages are enabled without NuxtPage being instantiated
-      addPlugin(resolve(runtimeDir, 'plugins/check-if-page-unused'))
+      addPlugin({ src: resolve(runtimeDir, 'plugins/check-if-page-unused'), _skipTypes: true })
     }
 
     nuxt.hook('app:templates', (app) => {
@@ -329,14 +329,15 @@ export default defineNuxtModule({
 
     nuxt.hook('builder:watch', async (event, relativePath) => {
       const path = resolve(nuxt.options.srcDir, relativePath)
+      if (event === 'change') { invalidatePageSymlink(nuxt, path) }
       const shouldAlwaysRegenerate = nuxt.options.experimental.scanPageMeta && isPage(path)
 
       if (event === 'change' && !shouldAlwaysRegenerate) { return }
 
-      // Attempt incremental tree update for page file add/unlink in dev mode
+      // Attempt incremental tree update for page file add/unlink/change in dev mode
       const layerIndex = pagesDirs.findIndex(dir => isWithinDir(path, dir))
 
-      if (pagesCtx && layerIndex !== -1 && !shouldAlwaysRegenerate) {
+      if (pagesCtx && layerIndex !== -1) {
         try {
           if (event === 'add') {
             const relativeToDir = relative(pagesDirs[layerIndex]!, path)
@@ -352,7 +353,7 @@ export default defineNuxtModule({
           nuxt.apps.default!.pages = await resolvePagesRoutes()
         }
       } else if (shouldAlwaysRegenerate || updateTemplatePaths.some(dir => isWithinDir(path, dir))) {
-        // Full rebuild: scanPageMeta content change, layout/middleware change, or no pagesCtx
+        // Full rebuild: page outside the pages dirs, layout/middleware change, or no pagesCtx
         nuxt.apps.default!.pages = await resolvePagesRoutes()
       }
     })

@@ -53,9 +53,13 @@ interface ProgramOptions {
   strictFetchPaths?: boolean
   /** Module-level source appended to the program. */
   source?: string[]
+  /** Whether the program resolves `#app`, so that the source can import the composables. */
+  composables?: boolean
 }
 
-function program ({ routes, sites }: ReturnType<typeof routeSet>, calls: number, { strict = true, strictFetchPaths = true, source = [] }: ProgramOptions = {}) {
+const appDir = join(repoRoot, 'packages/nuxt/src/app')
+
+function program ({ routes, sites }: ReturnType<typeof routeSet>, calls: number, { strict = true, strictFetchPaths = true, source = [], composables = false }: ProgramOptions = {}) {
   rmSync(workspace, { recursive: true, force: true })
   mkdirSync(workspace, { recursive: true })
 
@@ -93,10 +97,15 @@ function program ({ routes, sites }: ReturnType<typeof routeSet>, calls: number,
       target: 'es2022',
       allowImportingTsExtensions: true,
       types: [],
-      lib: ['es2023', 'dom'],
-      paths: { '#build/server-routes': ['./server-routes.ts'], ...dependencies },
+      lib: ['es2023', 'dom', ...composables ? ['dom.iterable', 'webworker'] : []],
+      paths: {
+        '#build/server-routes': ['./server-routes.ts'],
+        ...composables ? { '#app': [join(appDir, 'index')], '#app/*': [join(appDir, '*')], 'nuxt/app': [join(appDir, 'index')], '#unhead/composables': [join(repoRoot, 'packages/nuxt/src/head/runtime/composables')] } : {},
+        ...dependencies,
+      },
+      ...composables ? { noUncheckedIndexedAccess: true, verbatimModuleSyntax: true, isolatedModules: true, moduleDetection: 'force', allowJs: true, resolveJsonModule: true, esModuleInterop: true } : {},
     },
-    include: ['./calls.ts'],
+    include: ['./calls.ts', ...composables ? [join(repoRoot, 'packages/nuxt/src/build-stubs.d.ts')] : []],
   }))
 
   const out = execFileSync(process.execPath, [nuxtRequire.resolve('typescript/bin/tsc'), '-p', join(workspace, 'tsconfig.json'), '--extendedDiagnostics'], { cwd: repoRoot, encoding: 'utf8' })
@@ -124,13 +133,18 @@ describe('the cost of resolving a typed `$fetch` call', () => {
   }, 300_000)
 })
 
-describe('a typed `$fetch` read through its own signature', () => {
+describe('a typed `$fetch` wrapped or called with a response type it names', () => {
   const source = [
-    'export function api<T> (url: string, options: Parameters<typeof $fetch>[1] = {}) { return $fetch<T>(url, { ...options }) }',
-    'export function rawApi<T> (url: string, options: Parameters<typeof $fetch.raw>[1] = {}) { return $fetch.raw<T>(url, { ...options }) }',
+    `import type { FetchOptions } from '${typesModule}'`,
     'export function post<T> (url: string, body: Record<string, unknown>) { return $fetch<T>(url, { method: \'POST\', body }) }',
-    'export const request: Parameters<typeof $fetch>[0] = new Request(\'https://example.com\')',
-    'export const created: Parameters<ReturnType<typeof $fetch.create>>[1] = { method: \'PATCH\' }',
+    'export function external<T> (url: string, options: FetchOptions = {}) { return $fetch<T>(url, options) }',
+    'export const postOptions: FetchOptions = { method: \'POST\', body: { a: 1 }, query: { a: 1 }, headers: { a: \'b\' } }',
+    'import type { FetchOptions as OFetchOptions } from \'ofetch\'',
+    '// @ts-expect-error ofetch\'s `FetchOptions` types `method` as a plain `string`',
+    'export function viaOfetch<T> (url: string, options: OFetchOptions) { return $fetch<T>(url, options) }',
+    'export const api = $fetch.create({ headers: { \'x-client\': \'app\' } })',
+    'export const viaInstance = () => api(\'/api/group1/route1\')',
+    'export const request = () => $fetch(new Request(\'https://example.com\'))',
     'export async function named (url: string) {',
     '  await $fetch<unknown>(url, { method: \'PUT\' })',
     '  await $fetch<{ id?: number }>(url, { method: \'POST\' })',
@@ -146,6 +160,31 @@ describe('a typed `$fetch` read through its own signature', () => {
   ])('compiles against a large route set with a catch-all that validates a body (strict: $strict, strictFetchPaths: $strictFetchPaths)', (options) => {
     const set = routeSet(50)
     set.routes.push({ segments: [{ type: 'wildcard' }], metadata: { POST: { responseType: '{ proxied: true }', bodyType: '{ target: string }' } } })
-    program(set, 0, { ...options, source })
+    // ~3k as merged; the ceiling catches the options of two calls being related by measuring their
+    // variance, which costs ~200k and more as the route set grows
+    expect(program(set, 0, { ...options, source })).toBeLessThan(50_000)
   }, 60_000)
+
+  it('compiles a wrapper generic over the request that passes its options through', () => {
+    const set = routeSet(50)
+    set.routes.push({ segments: [{ type: 'wildcard' }], metadata: { POST: { responseType: '{ proxied: true }', bodyType: '{ target: string }' } } })
+    const wrapper = [
+      `import type { AnyServerRouteMethod, TypedFetchOptions } from '${typesModule}'`,
+      'export function api<R extends string, M extends AnyServerRouteMethod = \'get\'> (request: R, options?: TypedFetchOptions<R, M>) { return $fetch(request, options) }',
+    ]
+    expect(program(set, 0, { strictFetchPaths: false, source: wrapper })).toBeLessThan(50_000)
+  }, 60_000)
+})
+
+describe('the options of `useFetch` read through its own signature', () => {
+  it('compiles against a large route set', () => {
+    const source = [
+      `import type { UseFetch } from '${join(appDir, 'composables/fetch.ts')}'`,
+      'declare const useFetch: UseFetch',
+      'export type Options = Parameters<typeof useFetch>[1]',
+    ]
+    // ~410k as merged, nearly all of it checking the composables themselves; measuring the variance
+    // of `UseFetchOptions` instead of declaring it costs over 5M with this route set
+    expect(program(routeSet(50), 0, { source, composables: true })).toBeLessThan(1_000_000)
+  }, 120_000)
 })
