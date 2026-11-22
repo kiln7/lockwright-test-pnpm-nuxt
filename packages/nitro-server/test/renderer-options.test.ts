@@ -52,4 +52,45 @@ describe('renderer options', () => {
 
     expect(isRenderedErrorPage(context)).toBe(false)
   })
+
+  it('responds with 508 to a prerender request for a URL that is already rendering', async () => {
+    vi.resetModules()
+    vi.stubGlobal('__TEST_PRERENDER__', true)
+    const { prerenderDiagnostics } = await import('nuxt/internal/renderer/diagnostics')
+    const loop = vi.spyOn(prerenderDiagnostics, 'NUXT_E8018').mockImplementation(() => ({}) as any)
+    const { rendererOptions } = await import('../src/runtime/utils/renderer/options.ts')
+    const { wrapRender } = rendererOptions.prerender!
+    const event = (url: string) => ({ url: new URL(url, 'http://localhost') }) as RendererEvent
+
+    const nested = wrapRender!(event('/page'), () => wrapRender!(event('/other'), () => wrapRender!(event('/page'), () => Promise.resolve(new Response('page')))))
+
+    expect((await nested).status).toBe(508)
+    expect(loop).toHaveBeenCalledOnce()
+    expect(loop).toHaveBeenCalledWith({ url: '/page', chain: '`/page` -> `/other` -> `/page`' })
+  })
+})
+
+describe('renderer options while prerendering', () => {
+  afterAll(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('leaves logging a 5xx error of a prerender request to the prerenderer', async () => {
+    vi.resetModules()
+    vi.stubGlobal('__TEST_DEV__', false)
+    vi.stubGlobal('__TEST_PRERENDER__', true)
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { rendererOptions } = await import('../src/runtime/utils/renderer/options.ts')
+    const event = (headers: Record<string, string>) => ({ req: new Request('http://localhost/page', { headers }), url: new URL('http://localhost/page'), context: {} }) as unknown as RendererEvent
+    const prerender = { 'x-nitro-prerender': '/page' }
+
+    await rendererOptions.captureError!(Object.assign(new Error('handled'), { status: 500 }), { event: event(prerender) })
+    expect(log).not.toHaveBeenCalled()
+
+    await rendererOptions.captureError!(Object.assign(new Error('not prerendering'), { status: 500 }), { event: event({}) })
+    await rendererOptions.captureError!(new Error('without status'), { event: event(prerender) })
+    await rendererOptions.captureError!(Object.assign(new Error('unhandled'), { status: 500, unhandled: true }), { event: event(prerender) })
+    expect(log).toHaveBeenCalledTimes(3)
+    log.mockRestore()
+  })
 })

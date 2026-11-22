@@ -7,7 +7,7 @@ import type { NuxtSSRContext } from '#app/types'
 import { createRendererInstance } from 'nuxt/internal/renderer/instance'
 import type { NuxtRendererInstance } from 'nuxt/internal/renderer/instance'
 import { appEvent } from 'nuxt/internal/renderer/runtime'
-import type { NuxtRendererOptions, RendererHooks, RendererRouteRules } from 'nuxt/internal/renderer/runtime'
+import type { NuxtRendererOptions, RendererEvent, RendererHooks, RendererRouteRules } from 'nuxt/internal/renderer/runtime'
 
 import '../../context'
 
@@ -19,6 +19,7 @@ import { markStreamedResponse, rememberRenderBody, toRenderBody } from '../../co
 import { legacyCompat } from '#nuxt-compat/flags'
 import { payloadCache, prerenderRenderingURLs, sharedPrerenderCache } from '../cache'
 import { markRenderedErrorPage } from '../error-page'
+import { prerenderDiagnostics } from 'nuxt/internal/renderer/diagnostics'
 
 // @ts-expect-error private property consumed by vite-generated url helpers
 globalThis.__buildAssetsURL = buildAssetsURL
@@ -32,6 +33,12 @@ function createDocumentResponse (document: string | string[], init?: ResponseIni
     rememberRenderBody(response, rendered)
   }
   return response
+}
+
+/** Nitro's prerenderer logs a captured, handled 5xx error of a prerender request itself. */
+function isLoggedByPrerenderer (error: unknown, event: RendererEvent): boolean {
+  const { status, unhandled } = (error || {}) as { status?: number, unhandled?: boolean }
+  return !unhandled && !!status && status >= 500 && !!event.req.headers.get('x-nitro-prerender')
 }
 
 /** The capabilities Nitro provides to the Nuxt renderer. */
@@ -66,7 +73,7 @@ export const rendererOptions: NuxtRendererOptions = {
       markRenderedErrorPage(event.context)
     }
     // in development the live error channel reports and prints the error itself
-    if (!import.meta.dev && ((error as { status?: number } | null)?.status || 500) >= 500) {
+    if (!import.meta.dev && ((error as { status?: number } | null)?.status || 500) >= 500 && !(import.meta.prerender && isLoggedByPrerenderer(error, event))) {
       console.error(`[request error] [${event.req.method}] ${event.url.pathname}\n`, error)
     }
     useNitroApp().captureError?.(error as Error, { event: appEvent(event) as H3Event, tags: ['ssr', ...tags ?? []] })
@@ -87,11 +94,9 @@ export const rendererOptions: NuxtRendererOptions = {
           // a `useFetch`/`$fetch` against the URL currently rendering deadlocks the
           // build: https://github.com/nuxt/nuxt/issues/33871
           if (stack?.includes(renderingURL)) {
-            const chain = [...stack, renderingURL].filter(url => !url.startsWith('/__nuxt_error')).map(url => `"${url}"`).join(' -> ')
-            throw new HTTPError({
-              status: 508,
-              statusText: `Loop detected while prerendering "${renderingURL}" (${chain}). Check for \`useFetch\`/\`$fetch\` calls targeting a URL that is currently being rendered.`,
-            })
+            const chain = [...stack, renderingURL].filter(url => !url.startsWith('/__nuxt_error')).map(url => `\`${url}\``).join(' -> ')
+            prerenderDiagnostics.NUXT_E8018({ url: renderingURL, chain })
+            return Promise.resolve(new FastResponse(null, { status: 508, statusText: 'Loop Detected' }))
           }
           return prerenderRenderingURLs!.run([...(stack || []), renderingURL], render)
         },

@@ -18,15 +18,13 @@ export { pageDiagnostics } from '../diagnostics/pages.ts'
 export { configDiagnostics } from '../diagnostics/config.ts'
 export { headDiagnostics } from '../diagnostics/head.ts'
 export { bundlerDiagnostics } from '../diagnostics/bundler.ts'
-export { docsBase } from '../diagnostics/_shared.ts'
+export { docsBase, reporters as diagnosticReporters } from '../diagnostics/_shared.ts'
 
 export { reportPendingTemplates, trackPendingTemplate } from './pending-templates.ts'
 
 export { describeNativeImportFailure, getMissingCjsGlobal, isLoaderError, isMissingExportError, loadJiti, shouldReportJitiFallbackOnce } from './jiti.ts'
 
-export { findPackageMissingSubpath } from '../dependency.ts'
-
-export { resolvePostcssPluginPath, resolvePostcssPlugins } from './postcss.ts'
+export { resolvePostcssPlugin, resolvePostcssPluginPath, resolvePostcssPlugins, sortPostcssPlugins } from './postcss.ts'
 
 export { lookupNodeModuleSubpath, parseNodeModulePath } from './node-module.ts'
 export type { ParsedNodeModulePath } from './node-module.ts'
@@ -53,7 +51,10 @@ export { installModules } from '../module/install.ts'
 
 export { DEFAULT_JS_FILE_EXTENSIONS, DEFAULT_JSX_FILE_EXTENSIONS } from '../constants.ts'
 
-export { createServerBuild, setServerBuild, useServerBuild } from './server-build.ts'
+export { createServerBuild, resolveNitroDeployCommand, setServerBuild, useServerBuild } from './server-build.ts'
+
+export { reportNitroPrerender, startBuildEnvironment } from './build-report.ts'
+export type { BuildEnvironmentReport } from './build-report.ts'
 
 export { addClientBuildState, restoreClientBuildState, saveClientBuildState, waitForClientBuild } from './client-build-state.ts'
 export type { ClientBuildState } from './client-build-state.ts'

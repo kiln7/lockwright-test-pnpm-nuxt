@@ -12,7 +12,7 @@ import { resolveDevAllowedHosts } from 'nuxt/internal/dev-error'
 import { createNitro } from 'nitro/builder'
 import type { Nitro, NitroOptions as NitroBuilderOptions, NitroConfig } from 'nitro/types'
 import { addPlugin, addTemplate, addTypeTemplate, addVitePlugin, directoryToURL, ensureDependencyInstalled, getAddDependencyCommand, getDirectory, getLayerDirectories, isNuxtMajorVersion, packageName, resolveAlias, resolveIgnorePatterns, resolveNuxtModule, resolveTypePaths } from '@nuxt/kit'
-import { MAY_CONTAIN_DECORATOR_RE, assertSingleCatchAllRouteRuleKey, bundlerDiagnostics, encodeRoutePath, foldRouteCase, getServerRuntime, hasDecoratorSyntax, isWithinDir, lookupNodeModuleSubpath, mergeMethodRouteRulesRoutes, normalizeAppMiddlewareRules, parseNodeModulePath, resolveSpaLoadingTemplate, resolveSpaLoadingTemplatePath, setServerBuild } from '@nuxt/kit/internal'
+import { MAY_CONTAIN_DECORATOR_RE, assertSingleCatchAllRouteRuleKey, bundlerDiagnostics, encodeRoutePath, foldRouteCase, getServerRuntime, hasDecoratorSyntax, isWithinDir, lookupNodeModuleSubpath, mergeMethodRouteRulesRoutes, normalizeAppMiddlewareRules, parseNodeModulePath, reportNitroPrerender, resolveNitroDeployCommand, resolveSpaLoadingTemplate, resolveSpaLoadingTemplatePath, setServerBuild } from '@nuxt/kit/internal'
 import escapeRE from 'escape-string-regexp'
 import { defu } from 'defu'
 import { defineEventHandler } from 'nitro/h3'
@@ -25,6 +25,7 @@ import { runtimeDir as nitroRuntimeDir, runtimeDependencies } from 'nitro/meta'
 import nitroBuilder from '../package.json' with { type: 'json' }
 import { GLOB_SUFFIX_RE, NON_JS_FILE_RE, PATHS_SPECIFIER, distDir, getLayerNodeModulesExcludePattern, getServerReplacements, getSsrResolveConditions, nitroImplicitDependencies, relativeWithDot, timePluginHooks, toArray, toFsDriverIgnorePatterns, toModulePackageDir, toTranspileNoExternal, withoutServerDirDeny, withoutWasmConditions } from './utils.ts'
 import { setupAppManifest, setupPayloadRouteRules } from './app-manifest.ts'
+import { failOnPrerenderErrors } from './prerender.ts'
 import { canReuseSsrBuild, setupNitroViteEnvironment } from './vite.ts'
 import { setupLegacyDevAndBuild } from './legacy.ts'
 import { LOOPBACK_HOSTS, isLocalDevRequest, isLoopbackPeer, vouchForLoopbackPeer } from './dev-request.ts'
@@ -451,7 +452,8 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
       },
       plugins: [],
     },
-    logLevel: logLevelMapReverse[nuxt.options.logLevel],
+    // production builds are reported through the `build:*` hooks, so Nitro only prints warnings and errors
+    logLevel: nuxt.options.dev || nuxt.options.logLevel === 'silent' ? logLevelMapReverse[nuxt.options.logLevel] : 1,
   } satisfies NitroConfig)
 
   if (serverBundler === undefined || serverBundler === 'rolldown' || serverBundler === 'vite') {
@@ -807,6 +809,8 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
     },
   })
 
+  failOnPrerenderErrors(nitro)
+
   // the prerenderer copies `virtual` from the server, but its runtime config comes from `_config`
   nitro.hooks.hook('prerender:init', (prerenderer) => {
     prerenderer.options.virtual[RUNTIME_CONFIG_SCHEMA_ID] = () => getRuntimeConfigSchemaModule(nuxt, prerenderer)
@@ -841,6 +845,7 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
       server: resolve(distDir, 'runtime/server'),
     },
     preview: { command: () => nitro.options.commands.preview },
+    deploy: { command: () => resolveNitroDeployCommand(nitro.options.commands.deploy, nitro.options) },
     canReuseSsrBuild: environment => canReuseSsrBuild(nitro, environment),
   }, nuxt)
   await nuxt.callHook('nitro:init', nitro)
@@ -945,6 +950,9 @@ export async function bundle (nuxt: Nuxt & { _nitro?: Nitro }): Promise<void> {
   nitro.hooks.hook('prerender:routes', (routes) => {
     return nuxt.callHook('prerender:routes', { routes })
   })
+  if (!nuxt.options.dev) {
+    reportNitroPrerender(nitro, nuxt)
+  }
 
   // Enable runtime compiler client side
   if (nuxt.options.vue.runtimeCompiler) {
