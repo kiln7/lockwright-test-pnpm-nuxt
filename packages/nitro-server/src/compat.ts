@@ -13,43 +13,13 @@ import type { ResolverOptions } from 'exsolve'
 import escapeRE from 'escape-string-regexp'
 import { getLayerDirectories, isNuxtMajorVersion, resolveAlias } from '@nuxt/kit'
 import { isWithinDir, parseNodeModulePath, trackPendingTemplate } from '@nuxt/kit/internal'
-import type { Nuxt, ServerApi } from '@nuxt/schema'
+import type { NitroLegacyOptions, Nuxt, ResolvedNitroLegacyOptions, ServerApi } from '@nuxt/schema'
 import type { Nitro, NitroConfig, NitroOptions } from 'nitro/types'
 
 import { GLOB_SUFFIX_RE, distDir, nitroImplicitDependencies, toArray } from './utils.ts'
 import { nitroBuildDiagnostics } from './diagnostics.ts'
 import { getH3ExportNames, getH3ImportsPreset, getNuxtServerImportsPreset, nuxtServerImportsPreset, v2ImportsPreset } from './imports.ts'
 import { migratedPlugins, serverApiOf } from './registrations.ts'
-
-/**
- * Granular toggles for the opt-in `nitroLegacy` layer.
- *
- * Transitional: the whole compatibility layer is removed in Nuxt 6.
- */
-export interface NitroLegacyOptions {
-  /**
-   * Turn on the server auto-imports (as `experimental.nitroAutoImports` does), register the Nitro v2
-   * auto-import names (`defineNitroPlugin`, `cachedEventHandler`, `useEvent`, …) and auto-import from
-   * subdirectories of `server/utils/`.
-   */
-  imports?: boolean
-  /**
-   * Resolve `h3` to the bundled h3 v1 helpers in server code and, on Nuxt 4, in the server build of
-   * the app, and remove server aliases that point `h3` at h3 v1.
-   */
-  h3?: boolean
-  /** Resolve `nitropack`, `nitropack/runtime` and `#internal/nitro` to their Nitro v3 equivalents. */
-  specifiers?: boolean
-  /** Support the `useRuntimeConfig(event)` signature and its per-request semantics. */
-  runtimeConfig?: boolean
-  /**
-   * Accept Nitro v2 config shapes (handlers without a `route`) and keep dotted suffixes in
-   * server file names that Nitro v3 rejects.
-   */
-  config?: boolean
-}
-
-export type ResolvedNitroLegacyOptions = Required<NitroLegacyOptions>
 
 const LEGACY_KEYS = ['imports', 'h3', 'specifiers', 'runtimeConfig', 'config'] as const
 
@@ -1065,9 +1035,7 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
 
   if (legacy.config) {
     for (const handler of nitroConfig.handlers || []) {
-      const entry = handler as { route?: string, middleware?: boolean, handler: string }
-      // Nuxt's own `route: ''` middleware is not something a user can act on
-      normalizeLegacyHandlerRoute(entry, typeof entry.handler === 'string' && normalize(entry.handler).startsWith(ownRuntime) ? [] : unrouted)
+      normalizeLegacyHandlerRoute(handler as { route?: string, middleware?: boolean, handler: string }, unrouted)
     }
   }
 
@@ -1414,10 +1382,15 @@ export async function setupNitroCompat (nuxt: Nuxt, nitroConfig: NitroConfig, le
   return registerLateScope
 }
 
-/** Nitro v3 requires a `route`; a v2 handler without one was a global middleware. */
+/**
+ * Nitro v3 requires a `route`; a v2 handler without one was a global middleware. It is
+ * reported unless it sets `middleware: true`.
+ */
 function normalizeLegacyHandlerRoute (handler: { route?: string, middleware?: boolean, handler: string }, unrouted: string[]) {
   if (!handler.route) {
-    unrouted.push(typeof handler.handler === 'string' ? handler.handler : (handler.handler as unknown as () => unknown).name || 'an anonymous dev server handler')
+    if (!handler.middleware) {
+      unrouted.push(typeof handler.handler === 'string' ? handler.handler : (handler.handler as unknown as () => unknown).name || 'an anonymous dev server handler')
+    }
     handler.route = '/**'
     handler.middleware = true
   }
